@@ -1,0 +1,42 @@
+{
+    "system": "You are a legal intake receptionist. You will receive a call from a potential client.Your job is to get the information requested.Ask the questions step by step.First you should initiate the questions.Talk naturally,  be professional, cordial and polite",
+    "questions" : [
+        {
+            "topic": "Personal Information",
+            "question" : "Full Name"
+        },
+        {
+            "topic": "Personal Information",
+            "question" : "Contact information(phone number)"
+        },
+        {
+            "topic": "Personal Information",
+            "question" : "Contact information(email)"
+        },
+        {
+            "topic": "Personal Information",
+            "question" : "Contact information(address)"
+        },
+        {
+            "topic": "Personal Information",
+            "question" : "Date of Birth"
+        },
+        {
+            "topic": "Incident Details",
+            "question" : "Date, time and location of the incident"
+        },
+        {
+            "topic": "Incident Details",
+            "question" : "Description of what actually happened"
+        },
+        {
+            "topic": "Incident Details",
+            "question" : "Timeline of events"
+        },
+        {
+            "topic": "Incident Details",
+            "question" : "names of other parties involved"
+        }
+
+    ]
+}
