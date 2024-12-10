@@ -6,7 +6,7 @@ import asyncio
 import websockets
 from typing import List, Dict, Optional
 from pydantic import BaseModel
-from fastapi import FastAPI, WebSocket, Request, HTTPException
+from fastapi import FastAPI, WebSocket, Request, HTTPException, Body
 from fastapi.responses import HTMLResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.rest import Client
@@ -20,8 +20,10 @@ import uvicorn
 from datetime import datetime
 
 
+
 # Load environment variables
 load_dotenv()
+
 
 
 # Pydantic models for validation
@@ -33,40 +35,59 @@ class ConfigModel(BaseModel):
     system: str
     questions: List[QuestionModel]
 
-class OutboundCallRequest(BaseModel):
-    phone_number: str
-    callback_url: Optional[str] = None
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/app.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+
+# Configure logging
+def setup_logging():
+    formatter = logging.Formatter(
+        '%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # File handler
+    os.makedirs('logs', exist_ok=True)
+    file_handler = RotatingFileHandler(
+        'logs/app.log',
+        maxBytes=10*1024*1024,
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.DEBUG)  # Set to DEBUG level
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)  # Set to DEBUG level
+    logger.handlers.clear()
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
+
+logger = setup_logging()
+
 
 # Load config.json
 def load_config():
     with open('config.json', 'r') as f:
         return json.load(f)
+    
+
+
 
 CONFIG = load_config()
 SYSTEM_MESSAGE = CONFIG['system']
-
-
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
     'response.content.done', 'rate_limits.updated', 'response.done',
     'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped',
     'input_audio_buffer.speech_started', 'session.created']
 
-
-
-# Initialize FastAPI app
-app = FastAPI()
 
 # Environment variables
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
@@ -75,11 +96,14 @@ TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
 TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
 NGROK_AUTH_TOKEN = os.getenv('NGROK_AUTH_TOKEN')
 
+
+
+# Initialize FastAPI app
+app = FastAPI()
+
+
 # Initialize Twilio client
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-
-
 
 
 class PhoneAgent:
@@ -89,38 +113,56 @@ class PhoneAgent:
         self.responses = {}
         self.transcript = []
         self.questions = CONFIG['questions']
-        self._create_empty_transcript()
-        logger.info(f"New conversation started - Call SID: {call_sid}")
-
-
-    def _create_empty_transcript(self):
-        """Create an empty transcript file as soon as the conversation starts."""
-        try:
-            filename = f"transcripts/call_{self.call_sid}.txt"
-            with open(filename, 'w', encoding='utf-8') as f:
-                f.write("Legal Intake Call Transcript\n")
+        
+       # Create base directory for transcripts
+        self.base_dir = 'transcripts'
+        os.makedirs(self.base_dir, exist_ok=True)
+        
+        # Create transcript file path using call_sid
+        self.transcript_path = os.path.join(self.base_dir, f'{call_sid}.txt')
+        
+    
+        
+        # Initialize transcript file
+        with open(self.transcript_path, 'w', encoding='utf-8') as f:
+                f.write(f"AI Phone Agent Call Transcript\n")
                 f.write("=" * 50 + "\n\n")
-                f.write(f"Call Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("Status: Active\n\n")
+                f.write(f"Call SID: {call_sid}\n")
+                f.write(f"Call Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 f.write("Conversation:\n")
-                f.write("-" * 20 + "\n")
-            logger.info(f"Created empty transcript file for call {self.call_sid}")
+                f.write("-" * 20 + "\n\n")
+        logger.info(f"Created a transcript file: {self.transcript_path}")
+
+
+
+
+    async def add_to_transcript(self, speaker: str, message: str):
+        if not message or not message.strip():
+            return
+            
+        try:
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            entry = f"[{timestamp}] {speaker}: {message.strip()}\n"
+            
+            # Write to file immediately
+            with open(self.transcript_path, 'a', encoding='utf-8') as f:
+                f.write(entry)
+            
+            # Store in memory
+            self.transcript.append(entry)
+            logger.info(f"Added {speaker} message to transcript: {message[:50]}...")
         except Exception as e:
-            logger.error(f"Error creating empty transcript for call {self.call_sid}: {str(e)}")
+            logger.error(f"Error writing to transcript: {str(e)}")
 
+    async def save_transcript(self):
+        try:
+            with open(self.transcript_path, 'a', encoding='utf-8') as f:
+                f.write("\n" + "=" * 50 + "\n")
+                f.write(f"Call Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            logger.info(f"Saved final transcript for call {self.call_sid}")
+        except Exception as e:
+            logger.error(f"Error saving final transcript: {str(e)}")
 
-    def add_to_transcript(self, speaker: str, message: str):
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        entry = {
-            "timestamp": timestamp,
-            "speaker": speaker,
-            "message": message.strip()
-        }
-        self.transcript.append(entry)
-        filename = f"transcripts/call_{self.call_sid}.txt"
-        with open(filename, 'a', encoding='utf-8') as f:
-            f.write(f"[{entry['timestamp']}] {entry['speaker']}: {entry['message']}\n")
-        logger.info(f"Added to transcript - {speaker}: {message.strip()}")
 
     def get_next_question(self) -> Optional[str]:
         if self.current_question_index < len(self.questions):
@@ -128,65 +170,17 @@ class PhoneAgent:
             return f"For {question['topic']}, please provide your {question['question']}."
         return None
 
-    def save_transcript(self):
-        try:
-            filename = f"transcripts/call_{self.call_sid}.txt"
-            
-            # Read existing content
-            try:
-                with open(filename, 'r', encoding='utf-8') as f:
-                    existing_content = f.read()
-            except FileNotFoundError:
-                existing_content = "Legal Intake Call Transcript\n" + "=" * 50 + "\n\n"
-            
-            # Create new content
-            with open(filename, 'w', encoding='utf-8') as f:
-                # Write header if it's not already there
-                if not existing_content.startswith("Legal Intake Call"):
-                    f.write("Legal Intake Call Transcript\n")
-                    f.write("=" * 50 + "\n\n")
-                
-                # Write call end time
-                f.write(f"Call Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                f.write("Status: Completed\n\n")
-                
-                # Write conversation
-                f.write("Conversation:\n")
-                f.write("-" * 20 + "\n")
-                for entry in self.transcript:
-                    f.write(f"[{entry['timestamp']}] {entry['speaker']}: {entry['message']}\n")
-                
-                # Write collected information
-                f.write("\n\nCollected Information:\n")
-                f.write("-" * 20 + "\n")
-                for question in self.questions:
-                    key = f"{question['topic']}_{question['question']}"
-                    response = self.responses.get(key, "Not provided")
-                    f.write(f"\n{question['topic']} - {question['question']}:\n{response}\n")
-            
-            logger.info(f"Final transcript saved to: {filename}")
-            
-        except Exception as e:
-            logger.error(f"Error saving final transcript: {str(e)}")
-            # Try one last time to save at least some information
-            try:
-                with open(filename, 'a', encoding='utf-8') as f:
-                    f.write(f"\n\nError saving full transcript: {str(e)}\n")
-                    f.write(f"Call ended at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            except Exception as backup_error:
-                logger.error(f"Critical error saving transcript: {str(backup_error)}")
-
+    
+ 
 
 class ConversationManager:
     def __init__(self):
         self.conversations: Dict[str, PhoneAgent] = {}
         self.lock = asyncio.Lock()
-        logger.info("Conversation Manager initialized")
 
     async def add_conversation(self, call_sid: str) -> PhoneAgent:
         async with self.lock:
             if call_sid in self.conversations:
-                logger.info(f"Returning existing conversation for call {call_sid}")
                 return self.conversations[call_sid]
             
             phone_agent = PhoneAgent(call_sid)
@@ -198,21 +192,21 @@ class ConversationManager:
         async with self.lock:
             if call_sid in self.conversations:
                 try:
-                    conversation = self.conversations[call_sid]
-                    conversation.save_transcript()
+                    phone_agent = self.conversations[call_sid]
+                    # Save any final transcript
+                    await phone_agent.save_transcript()
+                    # Remove from dictionary
                     del self.conversations[call_sid]
-                    logger.info(f"Removed conversation and saved transcript for call {call_sid}")
+                    logger.info(f"Successfully removed conversation for call {call_sid}")
                 except Exception as e:
                     logger.error(f"Error during conversation cleanup: {str(e)}")
-                    # Try one last time to save
-                    try:
-                        filename = f"transcripts/call_{call_sid}.txt"
-                        with open(filename, 'a', encoding='utf-8') as f:
-                            f.write(f"\n\nError during cleanup: {str(e)}\n")
-                            f.write(f"Call forcefully ended at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                    except Exception as backup_error:
-                        logger.error(f"Critical error during final save attempt: {str(backup_error)}")
 
+
+    async def get_conversation(self, call_sid: str) -> Optional[PhoneAgent]:
+        async with self.lock:
+            return self.conversations.get(call_sid)
+
+                    
 # Initialize conversation manager
 conversation_manager = ConversationManager()
 
@@ -228,87 +222,83 @@ async def handle_incoming_call(request: Request):
     response = VoiceResponse()
     
     response.pause(length=1)
-    response.say("Please wait while I connect you to A.I. Voice Agent.")
+    response.say("Please wait while I connect you to A.I. Voice Agent. Hello!!!")
    
     host = request.url.hostname
     print(host)
     connect = Connect()
-    connect.stream(url=f'wss://{host}/media-stream')
+    connect.stream(url=f'wss://{host}/media-stream?call_type=incoming')
     response.append(connect)
     logger.info("New Incomming call.........")
     return HTMLResponse(content=str(response), media_type="application/xml")
 
-
-
-
-@app.post("/outbound-call")
-
-async def make_outbound_call(call_request: OutboundCallRequest):
-    try:
-        logger.info(f"Initiating outbound call to {call_request.phone_number}")
-        
-        # Create TwiML for the outbound call
-        response = VoiceResponse()
-        response.pause(length=1)
-        response.say("Welcome to our legal intake line. I'll be assisting you today.")
-        
-        # Get the ngrok URL from environment
-        base_url = os.getenv('BASE_URL')
-        if not base_url:
-            raise HTTPException(status_code=500, detail="BASE_URL not set")
-        
-        connect = Connect()
-        connect.stream(url=f'wss://{base_url}/media-stream')
-        response.append(connect)
-        
-        # Make the call using Twilio
-        call = twilio_client.calls.create(
-            to=call_request.phone_number,
-            from_=TWILIO_PHONE_NUMBER,
-            twiml=str(response)
-        )
-        
-        logger.info(f"Outbound call initiated - SID: {call.sid}")
-        return {"message": "Call initiated", "call_sid": call.sid}
-        
-    except Exception as e:
-        logger.error(f"Error making outbound call: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/make-call")
+async def make_call(phone_number: str = Body(..., embed=True)):
+    """Make an outgoing call to the specified phone number."""
+    if not phone_number:
+        logger.error("Phone number is required")
+        return {"error": "Phone number is required"}
+    
+    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    base_url = os.getenv('BASE_URL')
+    if not base_url:
+        raise HTTPException(status_code=500, detail="BASE_URL not set")
+    
+    call = client.calls.create(
+        url=f"{base_url}/outbound-call",  
+        to=phone_number,   
+        from_=TWILIO_PHONE_NUMBER
+    )
+    return {"call_sid": call.sid}
     
 
-@app.post("/call-status")
-async def call_status_callback(request: Request):
-    try:
-        form_data = await request.form()
-        call_sid = form_data.get('CallSid')
-        status = form_data.get('CallStatus')
+@app.api_route("/outbound-call", methods=["POST"])
+async def make_outbound_call(request: Request):
+    """Handle outgoing call and return TwiML response to connect to Media Stream"""
+    
+    logger.info(f"Initiating outbound call........")
         
-        logger.info(f"Call status update - SID: {call_sid}, Status: {status}")
-        
-        if status in ['completed', 'failed', 'busy', 'no-answer', 'canceled']:
-            await conversation_manager.remove_conversation(call_sid)
-        
-        return {"status": "success"}
-        
-    except Exception as e:
-        logger.error(f"Error in call status callback: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+    # Create TwiML for the call
+    response = VoiceResponse()
+    response.pause(length=1)  # Brief pause
+    
+    # Initial greeting
+    response.say("Welcome to our legal AI Phone Agent. Please stay on the line while I connect you with our assistant.")
+    response.pause(length=1)  # Give time for connection
+    response.say("Hello")
+    host = request.url.hostname
+    connect = Connect()
+    connect.stream(url=f'wss://{host}/media-stream?call_type=outbound')
+    response.append(connect)
+ 
+    logger.info(f"Outbound call initiated......")
+    return HTMLResponse(content=str(response) , media_type="application/xml")
+    
+    
 
 @app.websocket("/media-stream")
 async def handle_media_stream(websocket: WebSocket):
+
     await websocket.accept()
     stream_sid = None
     phone_agent = None
+    session_id = None
 
+    
+    logger.info(f"WebSocket connection accepted .............")
+
+    
     async with websockets.connect(
         'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01',
         extra_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "OpenAI-Beta": "realtime=v1"
-        }
+        },
+        
     ) as openai_ws:
-        # Send initial session configuration
+        logger.info("Connected to OpenAI WebSocket")
+        
+        # Send initial configuration
         await openai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
@@ -321,7 +311,8 @@ async def handle_media_stream(websocket: WebSocket):
                 "temperature": 0.8,
             }
         }))
-
+        logger.info("Sent initial configuration to OpenAI")
+        
         async def receive_from_twilio():
             nonlocal stream_sid, phone_agent
             try:
@@ -330,65 +321,49 @@ async def handle_media_stream(websocket: WebSocket):
                     if data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
                         phone_agent = await conversation_manager.add_conversation(stream_sid)
+                        logger.info(f"Started new conversation for stream {stream_sid}")
                     elif data['event'] == 'media' and openai_ws.open:
+                        # Send audio buffer to OpenAI
                         await openai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": data['media']['payload']
                         }))
             except WebSocketDisconnect:
-                if stream_sid:
-                    await conversation_manager.remove_conversation(stream_sid)
+                logger.info("WebSocket disconnected")
+                if openai_ws.open:
+                    await openai_ws.close()
 
         async def send_to_twilio():
+            """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
+            nonlocal stream_sid, session_id
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
-                    
-                    if response['type'] == 'response.content.part':
-                        content = response.get('content', '')
-                        if phone_agent and content.strip():
-                            phone_agent.add_to_transcript('Assistant', content)
-                    
-                    elif response['type'] == 'input_audio_buffer.speech_started':
-                        text = response.get('text', '')
-                        if phone_agent and text.strip():
-                            phone_agent.add_to_transcript('User', text)
-                            
-                            if phone_agent.current_question_index < len(phone_agent.questions):
-                                current_q = phone_agent.questions[phone_agent.current_question_index]
-                                key = f"{current_q['topic']}_{current_q['question']}"
-                                phone_agent.responses[key] = text
-                                phone_agent.current_question_index += 1
-                                
-                                next_question = phone_agent.get_next_question()
-                                if next_question:
-                                    await openai_ws.send(json.dumps({
-                                        "type": "message",
-                                        "content": next_question
-                                    }))
-                                else:
-                                    await openai_ws.send(json.dumps({
-                                        "type": "message",
-                                        "content": "Thank you for providing all the information. Is there anything else you'd like to add before we end the call?"
-                                    }))
-                    
-                    elif response['type'] == 'response.audio.delta' and response.get('delta'):
-                        audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
-                        await websocket.send_json({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {
-                                "payload": audio_payload
+                    if response['type'] in LOG_EVENT_TYPES:
+                        print(f"Received event: {response['type']}", response)
+                    if response['type'] == 'session.created':
+                        session_id = response['session']['id']
+                    if response['type'] == 'session.updated':
+                        print("Session updated successfully:", response)
+                    if response['type'] == 'response.audio.delta' and response.get('delta'):
+                        try:
+                            audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
+                            audio_delta = {
+                                "event": "media",
+                                "streamSid": stream_sid,
+                                "media": {
+                                    "payload": audio_payload
+                                }
                             }
-                        })
-                        
+                            await websocket.send_json(audio_delta)
+                        except Exception as e:
+                            print(f"Error processing audio data: {e}")
+                    if response['type'] == 'conversation.item.created':
+                        print(f"conversation.item.created event: {response}")
             except Exception as e:
-                logger.error(f"Error in send_to_twilio: {e}")
-                if stream_sid:
-                    await conversation_manager.remove_conversation(stream_sid)
+                print(f"Error in send_to_twilio: {e}")
 
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
-
 
 
 
@@ -404,7 +379,7 @@ if __name__ == "__main__":
     # Setup ngrok tunnel
     public_url = setup_ngrok()
     print(f"Server running at: {public_url}")
-    
+
     # Run the FastAPI application
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
