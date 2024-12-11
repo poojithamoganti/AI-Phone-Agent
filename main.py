@@ -18,6 +18,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import uvicorn
 from datetime import datetime
+import aiofiles
 
 
 
@@ -84,10 +85,18 @@ CONFIG = load_config()
 SYSTEM_MESSAGE = CONFIG['system']
 VOICE = 'alloy'
 LOG_EVENT_TYPES = [
-    'response.content.done', 'rate_limits.updated', 'response.done',
-    'input_audio_buffer.committed', 'input_audio_buffer.speech_stopped',
-    'input_audio_buffer.speech_started', 'session.created']
-
+    'conversation.item.input_audio_transcription.completed',
+    'input_audio_buffer.speech_started',
+    'input_audio_buffer.speech_stopped',
+    'input_audio_buffer.committed',
+    'response.audio_transcript.done',
+    'response.audio_transcript.delta',
+    'response.audio.delta',
+    'response.audio.done',
+    'conversation.item.created',
+    'session.created',
+    'session.updated'
+]
 
 # Environment variables
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
@@ -138,30 +147,34 @@ class PhoneAgent:
 
     async def add_to_transcript(self, speaker: str, message: str):
         if not message or not message.strip():
+            logger.debug(f"Skipping empty message from {speaker}")
             return
             
         try:
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             entry = f"[{timestamp}] {speaker}: {message.strip()}\n"
             
-            # Write to file immediately
-            with open(self.transcript_path, 'a', encoding='utf-8') as f:
-                f.write(entry)
+            # Write to file immediately with proper encoding
+            async with aiofiles.open(self.transcript_path, 'a', encoding='utf-8') as f:
+                await f.write(entry)
             
             # Store in memory
             self.transcript.append(entry)
-            logger.info(f"Added {speaker} message to transcript: {message[:50]}...")
+            logger.info(f"Successfully added {speaker} message to transcript")
+            logger.debug(f"Transcript entry: {entry.strip()}")
         except Exception as e:
-            logger.error(f"Error writing to transcript: {str(e)}")
+            logger.error(f"Error writing to transcript for {self.call_sid}: {str(e)}")
+            raise  # Re-raise to handle in caller
 
     async def save_transcript(self):
         try:
-            with open(self.transcript_path, 'a', encoding='utf-8') as f:
-                f.write("\n" + "=" * 50 + "\n")
-                f.write(f"Call Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            logger.info(f"Saved final transcript for call {self.call_sid}")
+            async with aiofiles.open(self.transcript_path, 'a', encoding='utf-8') as f:
+                await f.write("\n" + "=" * 50 + "\n")
+                await f.write(f"Call Ended: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            logger.info(f"Successfully saved final transcript for call {self.call_sid}")
         except Exception as e:
-            logger.error(f"Error saving final transcript: {str(e)}")
+            logger.error(f"Error saving final transcript for {self.call_sid}: {str(e)}")
+            raise  # Re-raise to handle in caller
 
 
     def get_next_question(self) -> Optional[str]:
@@ -210,7 +223,7 @@ class ConversationManager:
 # Initialize conversation manager
 conversation_manager = ConversationManager()
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 async def index_page():
     return {"message": "AI Phone Agent is running!"}
 
@@ -309,6 +322,9 @@ async def handle_media_stream(websocket: WebSocket):
                 "instructions": SYSTEM_MESSAGE,
                 "modalities": ["text", "audio"],
                 "temperature": 0.8,
+                "input_audio_transcription": {
+                    "model": "whisper-1"
+            }
             }
         }))
         logger.info("Sent initial configuration to OpenAI")
@@ -334,37 +350,60 @@ async def handle_media_stream(websocket: WebSocket):
                     await openai_ws.close()
 
         async def send_to_twilio():
-            """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, session_id
+            nonlocal stream_sid, session_id, phone_agent
+            
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
-                    if response['type'] in LOG_EVENT_TYPES:
-                        print(f"Received event: {response['type']}", response)
+                    
+                    # Handle session events
                     if response['type'] == 'session.created':
                         session_id = response['session']['id']
-                    if response['type'] == 'session.updated':
-                        print("Session updated successfully:", response)
-                    if response['type'] == 'response.audio.delta' and response.get('delta'):
+                        logger.info(f"Created new session: {session_id}")
+                    
+                    # Handle user transcripts
+                    elif response['type'] == 'conversation.item.input_audio_transcription.completed':
+                        if 'transcript' in response:
+                            user_text = response['transcript'].strip()
+                            if user_text and phone_agent:
+                                await phone_agent.add_to_transcript("User", user_text)
+                                logger.info(f"Saved user response: {user_text}")
+                                
+                                # Send a message to get AI response
+                                await openai_ws.send(json.dumps({
+                                    "type": "message.create",
+                                    "content": user_text,
+                                    "role": "user"
+                                }))
+                                            
+                    # Handle AI responses
+                    elif response['type'] == 'response.audio_transcript.done':
+                        if 'transcript' in response:
+                            ai_text = response['transcript'].strip()
+                            if ai_text and phone_agent:
+                                await phone_agent.add_to_transcript("AI Assistant", ai_text)
+                                logger.info(f"Saved AI response: {ai_text}")
+
+                    # Handle audio
+                    elif response['type'] == 'response.audio.delta' and response.get('delta'):
                         try:
                             audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
-                            audio_delta = {
+                            await websocket.send_json({
                                 "event": "media",
                                 "streamSid": stream_sid,
                                 "media": {
                                     "payload": audio_payload
                                 }
-                            }
-                            await websocket.send_json(audio_delta)
+                            })
                         except Exception as e:
-                            print(f"Error processing audio data: {e}")
-                    if response['type'] == 'conversation.item.created':
-                        print(f"conversation.item.created event: {response}")
+                            logger.error(f"Error processing audio: {str(e)}")
+                            
             except Exception as e:
-                print(f"Error in send_to_twilio: {e}")
-
+                logger.error(f"Error in send_to_twilio: {str(e)}")
+                if stream_sid and phone_agent:
+                    await conversation_manager.remove_conversation(stream_sid)
+        # Run both functions concurrently
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
-
 
 
 def setup_ngrok():
@@ -382,5 +421,3 @@ if __name__ == "__main__":
 
     # Run the FastAPI application
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
-
